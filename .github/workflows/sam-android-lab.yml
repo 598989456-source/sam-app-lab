@@ -97,7 +97,6 @@ jobs:
           grep -q "package: name='cn.samsclub.app'" apk-badging.txt
           grep -q "versionName='5.0.151'" apk-badging.txt
 
-          # Fingerprint taken from the user-provided 5.0.151 APK.
           EXPECTED_CERT="daef1c9db1528e60236b526aadf92642256ab102820d844cf2b8459cd5f94150"
           ACTUAL_CERT="$(grep -i 'certificate SHA-256 digest:' apk-signing.txt | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')"
           echo "Expected cert: $EXPECTED_CERT"
@@ -120,53 +119,44 @@ jobs:
           disk-size: 4096M
           force-avd-creation: false
           emulator-boot-timeout: 900
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -camera-front none
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -camera-front none -no-metrics
           script: |
-            set -eux
             mkdir -p artifacts
-
             adb wait-for-device
             adb devices -l | tee artifacts/adb-devices.txt
             adb shell getprop ro.product.cpu.abi | tee artifacts/emulator-abi.txt
             adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abilist.txt
             adb shell getprop ro.dalvik.vm.isa.arm64 | tee artifacts/arm64-translation.txt
             adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
-
             echo "=== APK native ABIs ===" | tee artifacts/apk-native-abis.txt
             unzip -l sam.apk 'lib/*' | awk '{print $4}' | grep '^lib/' | cut -d/ -f2 | sort -u | tee -a artifacts/apk-native-abis.txt || true
-
             adb install -r -g sam.apk | tee artifacts/install.txt
-
             adb logcat -c
             adb shell monkey -p cn.samsclub.app -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt || true
-
             sleep 25
-
-            adb shell uiautomator dump /sdcard/window.xml || true
-            adb pull /sdcard/window.xml artifacts/window.xml || true
-            adb exec-out screencap -p > artifacts/screen.png || true
-
+            adb shell uiautomator dump /sdcard/window-before-skip.xml || true
+            adb pull /sdcard/window-before-skip.xml artifacts/window-before-skip.xml || true
+            adb exec-out screencap -p > artifacts/screen-before-skip.png || true
+            adb shell input tap 969 180 || true
+            sleep 10
+            adb shell uiautomator dump /sdcard/window-after-skip.xml || true
+            adb pull /sdcard/window-after-skip.xml artifacts/window-after-skip.xml || true
+            adb exec-out screencap -p > artifacts/screen-after-skip.png || true
             adb shell dumpsys activity activities > artifacts/activity.txt || true
             adb shell dumpsys package cn.samsclub.app > artifacts/package.txt || true
-
-            {
-              echo "=== DNS / route ==="
-              adb shell getprop | grep -i dns || true
-              adb shell ip route || true
-              echo "=== Sam API reachability (DNS only / ping may be blocked) ==="
-              adb shell ping -c 1 api-sams.walmartmobile.cn || true
-            } > artifacts/network.txt
-
+            echo "=== DNS / route ===" > artifacts/network.txt
+            adb shell getprop | grep -i dns >> artifacts/network.txt || true
+            adb shell ip route >> artifacts/network.txt || true
+            echo "=== Sam API reachability ===" >> artifacts/network.txt
+            adb shell ping -c 1 api-sams.walmartmobile.cn >> artifacts/network.txt 2>&1 || true
             adb logcat -d -v time > artifacts/logcat.txt || true
-            grep -iE 'api-sams|walmartmobile|samsclub|UnknownHost|SSLHandshake|NetworkSecurityConfig|AndroidRuntime|FATAL EXCEPTION|crash' \
-              artifacts/logcat.txt > artifacts/logcat-focus.txt || true
-
-            echo "=== Foreground ===" | tee artifacts/summary.txt
-            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | tee -a artifacts/summary.txt || true
-            echo "=== Visible UI text ===" | tee -a artifacts/summary.txt
-            if [ -f artifacts/window.xml ]; then
-              sed 's/></>\n</g' artifacts/window.xml | grep -o 'text="[^"]*"' | head -100 | tee -a artifacts/summary.txt || true
-            fi
+            grep -iE 'api-sams|walmartmobile|samsclub|UnknownHost|SSLHandshake|NetworkSecurityConfig|AndroidRuntime|FATAL EXCEPTION|crash' artifacts/logcat.txt > artifacts/logcat-focus.txt || true
+            echo "=== Foreground ===" > artifacts/summary.txt
+            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' >> artifacts/summary.txt || true
+            echo "=== UI before Skip ===" >> artifacts/summary.txt
+            grep -o 'text="[^"]*"' artifacts/window-before-skip.xml | head -100 >> artifacts/summary.txt || true
+            echo "=== UI after Skip ===" >> artifacts/summary.txt
+            grep -o 'text="[^"]*"' artifacts/window-after-skip.xml | head -150 >> artifacts/summary.txt || true
 
       - name: Upload diagnostic artifacts
         if: always()
