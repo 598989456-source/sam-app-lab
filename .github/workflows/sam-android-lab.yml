@@ -106,7 +106,181 @@ jobs:
           mkdir -p artifacts
           cp apk-badging.txt apk-signing.txt sam-apk-sha256.txt artifacts/
 
-      - name: Boot Android 35 x86_64 with ARM translation, install and launch Sam app
+      - name: Prepare emulator automation
+        shell: bash
+        run: |
+          cat > ui_find.py <<'PY'
+          import argparse
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          ap = argparse.ArgumentParser()
+          ap.add_argument("xml")
+          g = ap.add_mutually_exclusive_group(required=True)
+          g.add_argument("--id")
+          g.add_argument("--text-regex")
+          args = ap.parse_args()
+
+          try:
+              root = ET.parse(args.xml).getroot()
+          except Exception:
+              sys.exit(1)
+
+          for node in root.iter("node"):
+              ok = False
+              if args.id is not None:
+                  ok = node.attrib.get("resource-id", "") == args.id
+              else:
+                  text = node.attrib.get("text", "") or node.attrib.get("content-desc", "")
+                  try:
+                      ok = re.search(args.text_regex, text, re.I) is not None
+                  except re.error:
+                      ok = False
+
+              if not ok:
+                  continue
+
+              bounds = node.attrib.get("bounds", "")
+              m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+              if not m:
+                  continue
+
+              x1, y1, x2, y2 = map(int, m.groups())
+              print((x1 + x2) // 2, (y1 + y2) // 2)
+              sys.exit(0)
+
+          sys.exit(1)
+          PY
+
+          cat > emulator_actions.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -u
+
+          mkdir -p artifacts
+
+          refresh_ui() {
+            adb shell uiautomator dump /sdcard/current.xml >/dev/null 2>&1 || return 1
+            adb pull /sdcard/current.xml artifacts/current.xml >/dev/null 2>&1 || return 1
+          }
+
+          snapshot() {
+            tag="$1"
+            adb shell uiautomator dump "/sdcard/${tag}.xml" >/dev/null 2>&1 || true
+            adb pull "/sdcard/${tag}.xml" "artifacts/${tag}.xml" >/dev/null 2>&1 || true
+            adb exec-out screencap -p > "artifacts/${tag}.png" || true
+          }
+
+          tap_id() {
+            rid="$1"
+            refresh_ui || return 1
+            xy="$(python3 ui_find.py artifacts/current.xml --id "$rid" 2>/dev/null)" || return 1
+            echo "tap resource-id=$rid at $xy"
+            adb shell input tap $xy
+            return 0
+          }
+
+          tap_text() {
+            pattern="$1"
+            refresh_ui || return 1
+            xy="$(python3 ui_find.py artifacts/current.xml --text-regex "$pattern" 2>/dev/null)" || return 1
+            echo "tap text regex=$pattern at $xy"
+            adb shell input tap $xy
+            return 0
+          }
+
+          contains_text() {
+            pattern="$1"
+            refresh_ui || return 1
+            python3 ui_find.py artifacts/current.xml --text-regex "$pattern" >/dev/null 2>&1
+          }
+
+          adb wait-for-device
+          adb devices -l | tee artifacts/adb-devices.txt
+          adb shell getprop ro.product.cpu.abi | tee artifacts/emulator-abi.txt
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abilist.txt
+          adb shell getprop ro.dalvik.vm.isa.arm64 | tee artifacts/arm64-translation.txt
+          adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
+
+          echo "=== APK native ABIs ===" | tee artifacts/apk-native-abis.txt
+          unzip -l sam.apk 'lib/*' | awk '{print $4}' | grep '^lib/' | cut -d/ -f2 | sort -u | tee -a artifacts/apk-native-abis.txt || true
+
+          adb install -r -g sam.apk | tee artifacts/install.txt
+
+          adb logcat -c
+          adb shell monkey -p cn.samsclub.app -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt || true
+          sleep 25
+          snapshot "00-launch"
+
+          # Welcome screen
+          tap_text '^(Skip|跳过)$' || true
+          sleep 5
+          snapshot "01-after-skip"
+
+          # Privacy agreement: checkbox then Agree.
+          tap_id 'cn.samsclub.app:id/iv_private_agreement' || true
+          sleep 1
+          tap_id 'cn.samsclub.app:id/dialog_confirm' || tap_text '^(Agree|同意)$' || true
+          sleep 8
+          snapshot "02-after-privacy"
+
+          # Walk ordinary onboarding/ad UI forward. We never enter credentials here.
+          for i in 1 2 3 4 5 6 7 8; do
+            if contains_text '(登录|手机号|手机号码|验证码|短信验证码|会员登录|Login|Sign in|phone number)'; then
+              echo "Login-like UI detected at navigation pass $i" | tee artifacts/login-detected.txt
+              snapshot "login-detected"
+              break
+            fi
+
+            tapped=0
+            for pattern in \
+              '^(Skip|跳过)$' \
+              '^(Close|关闭)$' \
+              '^(Agree|同意)$' \
+              '^(我知道了|知道了|Got it)$' \
+              '^(以后再说|稍后|Not now)$'
+            do
+              if tap_text "$pattern"; then
+                tapped=1
+                sleep 4
+                break
+              fi
+            done
+
+            snapshot "nav-${i}"
+            if [ "$tapped" -eq 0 ]; then
+              sleep 6
+            fi
+          done
+
+          snapshot "99-final"
+
+          adb shell dumpsys activity activities > artifacts/activity.txt || true
+          adb shell dumpsys package cn.samsclub.app > artifacts/package.txt || true
+
+          echo "=== DNS / route ===" > artifacts/network.txt
+          adb shell getprop | grep -i dns >> artifacts/network.txt || true
+          adb shell ip route >> artifacts/network.txt || true
+          echo "=== Sam API reachability ===" >> artifacts/network.txt
+          adb shell ping -c 1 api-sams.walmartmobile.cn >> artifacts/network.txt 2>&1 || true
+
+          adb logcat -d -v time > artifacts/logcat.txt || true
+          grep -iE 'api-sams|walmartmobile|samsclub|UnknownHost|SSLHandshake|NetworkSecurityConfig|AndroidRuntime|FATAL EXCEPTION|crash' \
+            artifacts/logcat.txt > artifacts/logcat-focus.txt || true
+
+          echo "=== Foreground ===" > artifacts/summary.txt
+          adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' >> artifacts/summary.txt || true
+          echo "=== Final UI text ===" >> artifacts/summary.txt
+          if [ -f artifacts/99-final.xml ]; then
+            grep -o 'text="[^"]*"' artifacts/99-final.xml | head -200 >> artifacts/summary.txt || true
+          fi
+          BASH
+
+          chmod +x emulator_actions.sh
+          python3 -m py_compile ui_find.py
+          bash -n emulator_actions.sh
+
+      - name: Boot Android 35 x86_64 with ARM translation, install and navigate Sam app
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -120,43 +294,7 @@ jobs:
           force-avd-creation: false
           emulator-boot-timeout: 900
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none -camera-front none -no-metrics
-          script: |
-            mkdir -p artifacts
-            adb wait-for-device
-            adb devices -l | tee artifacts/adb-devices.txt
-            adb shell getprop ro.product.cpu.abi | tee artifacts/emulator-abi.txt
-            adb shell getprop ro.product.cpu.abilist | tee artifacts/emulator-abilist.txt
-            adb shell getprop ro.dalvik.vm.isa.arm64 | tee artifacts/arm64-translation.txt
-            adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
-            echo "=== APK native ABIs ===" | tee artifacts/apk-native-abis.txt
-            unzip -l sam.apk 'lib/*' | awk '{print $4}' | grep '^lib/' | cut -d/ -f2 | sort -u | tee -a artifacts/apk-native-abis.txt || true
-            adb install -r -g sam.apk | tee artifacts/install.txt
-            adb logcat -c
-            adb shell monkey -p cn.samsclub.app -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt || true
-            sleep 25
-            adb shell uiautomator dump /sdcard/window-before-skip.xml || true
-            adb pull /sdcard/window-before-skip.xml artifacts/window-before-skip.xml || true
-            adb exec-out screencap -p > artifacts/screen-before-skip.png || true
-            adb shell input tap 969 180 || true
-            sleep 10
-            adb shell uiautomator dump /sdcard/window-after-skip.xml || true
-            adb pull /sdcard/window-after-skip.xml artifacts/window-after-skip.xml || true
-            adb exec-out screencap -p > artifacts/screen-after-skip.png || true
-            adb shell dumpsys activity activities > artifacts/activity.txt || true
-            adb shell dumpsys package cn.samsclub.app > artifacts/package.txt || true
-            echo "=== DNS / route ===" > artifacts/network.txt
-            adb shell getprop | grep -i dns >> artifacts/network.txt || true
-            adb shell ip route >> artifacts/network.txt || true
-            echo "=== Sam API reachability ===" >> artifacts/network.txt
-            adb shell ping -c 1 api-sams.walmartmobile.cn >> artifacts/network.txt 2>&1 || true
-            adb logcat -d -v time > artifacts/logcat.txt || true
-            grep -iE 'api-sams|walmartmobile|samsclub|UnknownHost|SSLHandshake|NetworkSecurityConfig|AndroidRuntime|FATAL EXCEPTION|crash' artifacts/logcat.txt > artifacts/logcat-focus.txt || true
-            echo "=== Foreground ===" > artifacts/summary.txt
-            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' >> artifacts/summary.txt || true
-            echo "=== UI before Skip ===" >> artifacts/summary.txt
-            grep -o 'text="[^"]*"' artifacts/window-before-skip.xml | head -100 >> artifacts/summary.txt || true
-            echo "=== UI after Skip ===" >> artifacts/summary.txt
-            grep -o 'text="[^"]*"' artifacts/window-after-skip.xml | head -150 >> artifacts/summary.txt || true
+          script: bash emulator_actions.sh
 
       - name: Upload diagnostic artifacts
         if: always()
