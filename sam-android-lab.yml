@@ -1,0 +1,165 @@
+name: Sam Android ARM64 Lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/sam-android-lab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sam-app-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "build-tools;35.0.0"
+
+      - name: Download current Sam's Club China APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import html, re, urllib.request
+
+          pages = [
+              "https://m.app.so.com/detail/index?id=1633978&pname=cn.samsclub.app",
+              "https://app.so.com/detail/index?id=1633978&pt=oauth",
+          ]
+          ua = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+
+          found = None
+          last = ""
+          for page in pages:
+              req = urllib.request.Request(page, headers={"User-Agent": ua})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  raw = r.read().decode("utf-8", "ignore")
+              raw = html.unescape(raw)
+              last = raw
+              urls = re.findall(
+                  r'https://s\.shouji\.qihucdn\.com/[^"\'<>\s]+?cn\.samsclub\.app_\d+\.apk[^"\'<>\s]*',
+                  raw,
+              )
+              if urls:
+                  found = urls[0]
+                  break
+
+          if not found:
+              open("download-page.html", "w", encoding="utf-8").write(last)
+              raise SystemExit("Could not discover APK URL from the 360 app page")
+
+          print("Discovered:", found.split("?")[0])
+          req = urllib.request.Request(found, headers={"User-Agent": ua, "Referer": pages[0]})
+          with urllib.request.urlopen(req, timeout=120) as r, open("sam.apk", "wb") as f:
+              while True:
+                  b = r.read(1024 * 1024)
+                  if not b:
+                      break
+                  f.write(b)
+          PY
+
+          ls -lh sam.apk
+          sha256sum sam.apk | tee sam-apk-sha256.txt
+
+      - name: Verify package, version and signing certificate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+
+          "$AAPT" dump badging sam.apk | tee apk-badging.txt
+          "$APKSIGNER" verify --print-certs sam.apk | tee apk-signing.txt
+
+          grep -q "package: name='cn.samsclub.app'" apk-badging.txt
+          grep -q "versionName='5.0.151'" apk-badging.txt
+
+          # Fingerprint taken from the user-provided 5.0.151 APK.
+          EXPECTED_CERT="daef1c9db1528e60236b526aadf92642256ab102820d844cf2b8459cd5f94150"
+          ACTUAL_CERT="$(grep -i 'certificate SHA-256 digest:' apk-signing.txt | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')"
+          echo "Expected cert: $EXPECTED_CERT"
+          echo "Actual cert:   $ACTUAL_CERT"
+          test "$ACTUAL_CERT" = "$EXPECTED_CERT"
+
+          mkdir -p artifacts
+          cp apk-badging.txt apk-signing.txt sam-apk-sha256.txt artifacts/
+
+      - name: Boot ARM64 Android, install and launch Sam app
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: arm64-v8a
+          profile: pixel_4
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          disk-size: 4096M
+          disable-linux-hw-accel: true
+          emulator-boot-timeout: 1800
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -accel off
+          script: |
+            set -euxo pipefail
+            mkdir -p artifacts
+
+            adb wait-for-device
+            adb shell getprop ro.product.cpu.abi | tee artifacts/emulator-abi.txt
+            adb shell getprop ro.build.version.release | tee artifacts/android-version.txt
+
+            adb install -r -g sam.apk | tee artifacts/install.txt
+
+            adb logcat -c
+            adb shell monkey -p cn.samsclub.app -c android.intent.category.LAUNCHER 1 | tee artifacts/launch.txt || true
+
+            sleep 25
+
+            adb shell uiautomator dump /sdcard/window.xml || true
+            adb pull /sdcard/window.xml artifacts/window.xml || true
+            adb exec-out screencap -p > artifacts/screen.png || true
+
+            adb shell dumpsys activity activities > artifacts/activity.txt || true
+            adb shell dumpsys package cn.samsclub.app > artifacts/package.txt || true
+
+            {
+              echo "=== DNS / route ==="
+              adb shell getprop | grep -i dns || true
+              adb shell ip route || true
+              echo "=== Sam API reachability (DNS only / ping may be blocked) ==="
+              adb shell ping -c 1 api-sams.walmartmobile.cn || true
+            } > artifacts/network.txt
+
+            adb logcat -d -v time > artifacts/logcat.txt || true
+            grep -iE 'api-sams|walmartmobile|samsclub|UnknownHost|SSLHandshake|NetworkSecurityConfig|AndroidRuntime|FATAL EXCEPTION|crash' \
+              artifacts/logcat.txt > artifacts/logcat-focus.txt || true
+
+            echo "=== Foreground ===" | tee artifacts/summary.txt
+            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | tee -a artifacts/summary.txt || true
+            echo "=== Visible UI text ===" | tee -a artifacts/summary.txt
+            if [ -f artifacts/window.xml ]; then
+              sed 's/></>\n</g' artifacts/window.xml | grep -o 'text="[^"]*"' | head -100 | tee -a artifacts/summary.txt || true
+            fi
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sam-android-lab-results
+          path: |
+            artifacts/
+            download-page.html
+          if-no-files-found: ignore
+          retention-days: 3
